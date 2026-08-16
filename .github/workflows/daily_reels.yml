@@ -1,0 +1,65 @@
+name: Daily AI Reels Pipeline
+
+# Runs 4 times a day, spread out (times in UTC -- adjust to your preferred IST slots).
+# IST = UTC + 5:30, so these UTC times correspond to roughly:
+#   03:30 UTC -> 9:00 AM IST
+#   08:30 UTC -> 2:00 PM IST
+#   12:30 UTC -> 6:00 PM IST
+#   15:30 UTC -> 9:00 PM IST
+on:
+  schedule:
+    - cron: "30 3 * * *"
+    - cron: "30 8 * * *"
+    - cron: "30 12 * * *"
+    - cron: "30 15 * * *"
+  workflow_dispatch:  # lets you manually trigger a run from the Actions tab, for testing
+
+jobs:
+  make-and-post-reel:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-noto
+
+      - name: Install Python dependencies
+        run: |
+          pip install --break-system-packages feedparser edge-tts requests
+
+      - name: Determine which run slot this is (0-3)
+        id: slot
+        run: |
+          HOUR=$(date -u +%H)
+          if [ "$HOUR" -lt 6 ]; then echo "index=0" >> $GITHUB_OUTPUT
+          elif [ "$HOUR" -lt 11 ]; then echo "index=1" >> $GITHUB_OUTPUT
+          elif [ "$HOUR" -lt 14 ]; then echo "index=2" >> $GITHUB_OUTPUT
+          else echo "index=3" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run pipeline
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          REPO_FULL_NAME: ${{ secrets.REPO_FULL_NAME }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_INDEX: ${{ steps.slot.outputs.index }}
+        run: python run_pipeline.py
+
+      - name: Commit updated dedupe log
+        run: |
+          git config user.name "sanaw-ai-bot"
+          git config user.email "actions@github.com"
+          git add posted_headlines.json
+          git diff --staged --quiet || git commit -m "Update posted headlines log [skip ci]"
+          git push
