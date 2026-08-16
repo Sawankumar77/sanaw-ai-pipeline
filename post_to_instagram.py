@@ -29,7 +29,9 @@ import requests
 IG_USER_ID = os.environ.get("IG_USER_ID")
 IG_ACCESS_TOKEN = os.environ.get("IG_ACCESS_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_REPO = os.environ.get("GITHUB_REPO")  # "username/repo"
+GITHUB_REPO = os.environ.get("REPO_FULL_NAME")  # e.g. "Sawankumar77/sanaw-ai-pipeline"
+# (named REPO_FULL_NAME, not GITHUB_REPO, because GitHub Actions blocks any
+# secret name starting with "GITHUB_" -- that prefix is reserved)
 
 GRAPH_BASE = "https://graph.instagram.com/v21.0"
 
