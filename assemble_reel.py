@@ -101,41 +101,58 @@ def get_audio_duration(audio_path: str) -> float:
 # ---------------------------------------------------------------------------
 # 2. Background: Pexels stock video, else generated motion graphic
 # ---------------------------------------------------------------------------
+GENERIC_TECH_FALLBACKS = [
+    "artificial intelligence technology",
+    "computer coding screen",
+    "futuristic technology abstract",
+    "data digital network",
+]
+
+
 def fetch_pexels_background(keywords: str, duration: float, workdir: Path) -> str | None:
     if not PEXELS_API_KEY:
         return None
-    try:
-        resp = requests.get(
-            PEXELS_SEARCH_URL,
-            headers={"Authorization": PEXELS_API_KEY},
-            params={"query": keywords, "orientation": "portrait", "per_page": 10},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        videos = resp.json().get("videos", [])
-        if not videos:
-            return None
-        random.shuffle(videos)
-        for v in videos:
-            files = sorted(
-                v.get("video_files", []),
-                key=lambda f: f.get("height", 0), reverse=True,
+    # Try the specific headline keywords first, then progressively more
+    # generic tech terms -- AI/tech news headlines (e.g. company names,
+    # niche product names) often return zero stock footage matches, so
+    # falling straight to the gradient throws away good real-footage
+    # opportunities. Only fall back to the gradient if ALL of these miss.
+    for query in [keywords] + GENERIC_TECH_FALLBACKS:
+        try:
+            resp = requests.get(
+                PEXELS_SEARCH_URL,
+                headers={"Authorization": PEXELS_API_KEY},
+                params={"query": query, "orientation": "portrait", "per_page": 10},
+                timeout=15,
             )
-            portrait_files = [f for f in files if f.get("height", 0) >= f.get("width", 1)]
-            candidates = portrait_files or files
-            if not candidates:
+            resp.raise_for_status()
+            videos = resp.json().get("videos", [])
+            if not videos:
+                print(f"[info] Pexels: no results for '{query}', trying next fallback...")
                 continue
-            url = candidates[0]["link"]
-            local_path = workdir / "bg_raw.mp4"
-            with requests.get(url, stream=True, timeout=30) as r:
-                r.raise_for_status()
-                with open(local_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        f.write(chunk)
-            return str(local_path)
-    except Exception as e:
-        print(f"[warn] Pexels fetch failed: {e}", file=sys.stderr)
-        return None
+            random.shuffle(videos)
+            for v in videos:
+                files = sorted(
+                    v.get("video_files", []),
+                    key=lambda f: f.get("height", 0), reverse=True,
+                )
+                portrait_files = [f for f in files if f.get("height", 0) >= f.get("width", 1)]
+                candidates = portrait_files or files
+                if not candidates:
+                    continue
+                url = candidates[0]["link"]
+                local_path = workdir / "bg_raw.mp4"
+                with requests.get(url, stream=True, timeout=30) as r:
+                    r.raise_for_status()
+                    with open(local_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                print(f"[ok] Pexels: using footage matched to '{query}'")
+                return str(local_path)
+        except Exception as e:
+            print(f"[warn] Pexels fetch failed for '{query}': {e}", file=sys.stderr)
+            continue
+    print("[warn] Pexels: all queries (specific + generic) returned nothing, using gradient fallback.")
     return None
 
 
@@ -183,14 +200,16 @@ def prep_background(bg_source: str, duration: float, workdir: Path) -> str:
 # ---------------------------------------------------------------------------
 # 2b. Stitch multiple avatar clips (e.g. Veo-generated) end-to-end
 # ---------------------------------------------------------------------------
-def stitch_avatar_clips(clip_paths: list[str], workdir: Path) -> tuple[str, float]:
+def stitch_avatar_clips(clip_paths: list[str], workdir: Path, keep_audio: bool = False) -> tuple[str, float]:
     """
     Concatenate several short avatar clips (from Gemini/Veo, ~8-10s each,
     downloaded manually) into one continuous background clip.
 
-    Each clip is first normalized to the same resolution/fps/codec, since
-    ffmpeg's concat demuxer requires matching streams -- Veo exports can
-    vary slightly in encoding between generations.
+    keep_audio=False (default): strips each clip's audio, since a separate
+        Hindi voiceover (edge-tts) will be laid on top instead.
+    keep_audio=True: preserves each clip's own audio -- use this when your
+        Veo clips already have YOUR cloned voice speaking, generated
+        directly in the Gemini app, and you don't want it replaced.
 
     Returns (path_to_stitched_video, total_duration_seconds).
     """
@@ -203,16 +222,18 @@ def stitch_avatar_clips(clip_paths: list[str], workdir: Path) -> tuple[str, floa
             f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
             f"crop={WIDTH}:{HEIGHT},fps={FPS},setsar=1",
             "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-            "-an",  # drop each clip's own audio -- your Hindi voiceover replaces it
-            str(norm_path),
         ]
+        if keep_audio:
+            cmd += ["-c:a", "aac", "-b:a", "128k"]
+        else:
+            cmd += ["-an"]
+        cmd.append(str(norm_path))
         subprocess.run(cmd, check=True, capture_output=True)
         normalized.append(norm_path)
 
     concat_list = workdir / "concat_list.txt"
     with open(concat_list, "w", encoding="utf-8") as f:
         for p in normalized:
-            # ffmpeg concat demuxer needs forward slashes and escaped quotes
             f.write(f"file '{str(p).replace(chr(92), '/')}'" + "\n")
 
     stitched_path = workdir / "avatar_stitched.mp4"
@@ -224,7 +245,7 @@ def stitch_avatar_clips(clip_paths: list[str], workdir: Path) -> tuple[str, floa
     ]
     subprocess.run(cmd, check=True, capture_output=True)
 
-    total_duration = get_audio_duration(str(stitched_path))  # works for video too via ffprobe
+    total_duration = get_audio_duration(str(stitched_path))
     return str(stitched_path), total_duration
 
 
@@ -301,22 +322,35 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 # ---------------------------------------------------------------------------
 # 4. Final assembly: background + audio + burned captions + branding
 # ---------------------------------------------------------------------------
-def assemble(audio_path: str, script_text: str, keywords: str, out_path: str,
-             avatar_clips: list[str] | None = None):
+def assemble(audio_path: str | None, script_text: str, keywords: str, out_path: str,
+             avatar_clips: list[str] | None = None, use_own_voice: bool = False):
+    """
+    use_own_voice=True: your Veo clips already contain your cloned voice
+        speaking the script -- audio_path can be None, we use the clips'
+        own audio track directly instead of generating edge-tts.
+    use_own_voice=False (default): audio_path is required, a separate
+        Hindi voiceover (edge-tts) is used, and clip audio is stripped.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         workdir = Path(tmp)
-        duration = get_audio_duration(audio_path)
 
-        if avatar_clips:
-            # Your Veo/Gemini avatar clips, stitched end-to-end and matched
-            # to the voiceover's exact length
-            stitched, _ = stitch_avatar_clips(avatar_clips, workdir)
+        if avatar_clips and use_own_voice:
+            stitched, stitched_duration = stitch_avatar_clips(avatar_clips, workdir, keep_audio=True)
+            bg_final = stitched          # already has correct audio baked in
+            duration = stitched_duration  # caption timing follows the clips' own length
+            final_audio_path = None       # no separate audio track to mix in
+        elif avatar_clips:
+            duration = get_audio_duration(audio_path)
+            stitched, _ = stitch_avatar_clips(avatar_clips, workdir, keep_audio=False)
             bg_final = match_avatar_to_voiceover(stitched, duration, workdir)
+            final_audio_path = audio_path
         else:
+            duration = get_audio_duration(audio_path)
             bg_raw = fetch_pexels_background(keywords, duration, workdir)
             if bg_raw is None:
                 bg_raw = generate_motion_background(duration, workdir)
             bg_final = prep_background(bg_raw, duration, workdir)
+            final_audio_path = audio_path
 
         ass_path = build_ass_captions(script_text, duration, workdir)
         ass_escaped = str(ass_path).replace("\\", "/").replace(":", "\\:")
@@ -340,14 +374,18 @@ def assemble(audio_path: str, script_text: str, keywords: str, out_path: str,
         cmd = [
             "ffmpeg", "-y",
             "-i", bg_final,
-            "-i", audio_path,
+        ]
+        if final_audio_path:
+            cmd += ["-i", final_audio_path]
+        cmd += [
             "-vf", vf,
             "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-            "-c:a", "aac", "-b:a", "128k",
-            "-shortest",
-            "-r", str(FPS),
-            out_path,
         ]
+        if final_audio_path:
+            cmd += ["-c:a", "aac", "-b:a", "128k", "-shortest"]
+        else:
+            cmd += ["-c:a", "aac", "-b:a", "128k"]  # keep bg_final's own (baked-in) audio
+        cmd += ["-r", str(FPS), out_path]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             print(result.stderr, file=sys.stderr)
@@ -358,7 +396,8 @@ def assemble(audio_path: str, script_text: str, keywords: str, out_path: str,
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--audio", required=True)
+    p.add_argument("--audio", default=None,
+                    help="Hindi voiceover file. Not needed if --use-own-voice is set.")
     p.add_argument("--script", required=True)
     p.add_argument("--keywords", default="technology abstract")
     p.add_argument("--out", required=True)
@@ -367,8 +406,21 @@ def main():
         help="Path(s) to your Gemini/Veo avatar clips, in order. "
              "If given, these replace the Pexels/gradient background entirely."
     )
+    p.add_argument(
+        "--use-own-voice", action="store_true",
+        help="Your avatar clips already contain your own cloned voice (generated "
+             "in the Gemini app) -- keep that audio instead of generating edge-tts. "
+             "Requires --avatar-clips; --audio is ignored/not required."
+    )
     args = p.parse_args()
-    assemble(args.audio, args.script, args.keywords, args.out, avatar_clips=args.avatar_clips)
+
+    if args.use_own_voice and not args.avatar_clips:
+        p.error("--use-own-voice requires --avatar-clips")
+    if not args.use_own_voice and not args.audio:
+        p.error("--audio is required unless --use-own-voice is set")
+
+    assemble(args.audio, args.script, args.keywords, args.out,
+              avatar_clips=args.avatar_clips, use_own_voice=args.use_own_voice)
 
 
 if __name__ == "__main__":
