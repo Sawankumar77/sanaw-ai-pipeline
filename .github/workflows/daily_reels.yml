@@ -17,6 +17,8 @@ on:
 jobs:
   make-and-post-reel:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # needed to create GitHub Releases (public video hosting) and push the dedupe log
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
