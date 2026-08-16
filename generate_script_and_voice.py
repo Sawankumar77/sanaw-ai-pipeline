@@ -13,6 +13,7 @@ import edge_tts
 import requests
 import os
 import json
+import time
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")  # free key from https://aistudio.google.com/apikey
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
@@ -36,17 +37,33 @@ Summary: {summary}
 Hindi script:"""
 
 
-def generate_hindi_script(title, summary):
+def generate_hindi_script(title, summary, max_retries=3):
     prompt = SCRIPT_PROMPT.format(title=title, summary=summary)
-    resp = requests.post(
-        GEMINI_URL,
-        headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
-        json={"contents": [{"parts": [{"text": prompt}]}]},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(
+                GEMINI_URL,
+                headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+                json={"contents": [{"parts": [{"text": prompt}]}]},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except requests.exceptions.HTTPError as e:
+            last_error = e
+            # 503/429 are transient (server overload / rate limit) -- worth retrying.
+            # Other errors (401, 400, etc.) are config problems, retrying won't help.
+            status = e.response.status_code if e.response is not None else None
+            if status in (503, 429) and attempt < max_retries - 1:
+                wait = 5 * (attempt + 1)  # 5s, 10s, 15s
+                print(f"[warn] Gemini API returned {status}, retrying in {wait}s "
+                      f"(attempt {attempt + 1}/{max_retries})...")
+                time.sleep(wait)
+                continue
+            raise
+    raise last_error
 
 
 async def text_to_speech(text, output_path, voice="hi-IN-MadhurNeural"):
